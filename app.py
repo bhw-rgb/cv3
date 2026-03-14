@@ -1,16 +1,11 @@
 import os
-import time
 import tempfile
-from pathlib import Path
-from typing import Dict, Tuple, List
-
 import numpy as np
 import nibabel as nib
 import matplotlib.pyplot as plt
 import streamlit as st
 import torch
-import plotly.graph_objects as go
-
+from scipy import ndimage
 from monai.inferers import sliding_window_inference
 from monai.networks.nets import UNet
 from monai.networks.layers import Norm
@@ -26,235 +21,253 @@ from monai.transforms import (
 )
 
 # ============================================================
-# 0. Streamlit 기본 설정
+# 0. Streamlit Configuration
 # ============================================================
 st.set_page_config(
-    page_title="MONAI 3D Segmentation Demo",
+    page_title="Medical Image Segmentation & Post-processing",
     page_icon="🧠",
     layout="wide",
 )
 
-st.title("🧠 MONAI + Streamlit 3D 의료영상 데모")
-st.markdown("""
-이 앱은 NIfTI(.nii / .nii.gz) 파일을 업로드하거나 샘플 데이터를 생성하여 3D Segmentation 추론 결과를 시각적으로 확인합니다.
-2D 슬라이스 뷰어와 **인터랙티브 3D 뷰어**를 모두 제공합니다.
-""")
+st.title("🧠 Medical Image Segmentation & Post-processing")
 
 # ============================================================
-# 1. Session State 초기화
+# 1. Utility Functions
 # ============================================================
-if "inference_done" not in st.session_state:
-    st.session_state.inference_done = False
-if "result" not in st.session_state:
-    st.session_state.result = None
-if "raw_shape" not in st.session_state:
-    st.session_state.raw_shape = None
-if "source_name" not in st.session_state:
-    st.session_state.source_name = None
-if "source_token" not in st.session_state:
-    st.session_state.source_token = None
 
+def calculate_dice(y_true, y_pred):
+    y_true_f = y_true.flatten()
+    y_pred_f = y_pred.flatten()
+    intersection = np.sum(y_true_f * y_pred_f)
+    return (2. * intersection + 1e-6) / (np.sum(y_true_f) + np.sum(y_pred_f) + 1e-6)
 
-# ============================================================
-# 2. 유틸리티 함수
-# ============================================================
-def is_nifti_file_name(file_name: str) -> bool:
-    lower = file_name.lower()
-    return lower.endswith(".nii") or lower.endswith(".nii.gz")
+def post_process(mask, lcc=False, small_obj_removal=False, min_size=100, binary_closing=False, closing_iterations=1):
+    processed = mask.copy()
+    
+    if lcc:
+        labels, num_features = ndimage.label(processed)
+        if num_features > 0:
+            sizes = ndimage.sum(np.ones_like(processed), labels, range(1, num_features + 1))
+            largest_label = np.argmax(sizes) + 1
+            processed = (labels == largest_label).astype(np.uint8)
+            
+    if small_obj_removal:
+        labels, num_features = ndimage.label(processed)
+        if num_features > 0:
+            sizes = ndimage.sum(np.ones_like(processed), labels, range(1, num_features + 1))
+            mask_size = sizes < min_size
+            remove_pixel = mask_size[labels - 1]
+            processed[remove_pixel] = 0
+            processed = (processed > 0).astype(np.uint8)
+            
+    if binary_closing:
+        processed = ndimage.binary_closing(processed, iterations=closing_iterations).astype(np.uint8)
+        
+    return processed
 
-def list_nifti_files(folder_path: str, recursive: bool = False) -> List[str]:
-    folder = Path(folder_path)
-    if not folder.exists() or not folder.is_dir(): return []
-    candidates = folder.rglob("*") if recursive else folder.iterdir()
-    files = [str(p.resolve()) for p in candidates if p.is_file() and is_nifti_file_name(p.name)]
-    files.sort()
-    return files
-
-def generate_synthetic_nifti():
-    size = (96, 96, 96)
-    data = np.zeros(size, dtype=np.float32)
-    z, y, x = np.ogrid[:size[0], :size[1], :size[2]]
-    center = (48, 48, 48)
-    dist_from_center = np.sqrt((x - center[0])**2 + (y - center[1])**2 + (z - center[2])**2)
-    data[dist_from_center <= 25] = 100.0
-    data += np.random.normal(-50, 20, size)
-    affine = np.eye(4)
-    image = nib.Nifti1Image(data, affine)
-    with tempfile.NamedTemporaryFile(suffix=".nii.gz", delete=False) as tmp:
-        nib.save(image, tmp.name)
-        return tmp.name
-
-def visualize_3d_mask(mask_np):
-    try:
-        step = 2
-        sub_mask = mask_np[::step, ::step, ::step]
-        if sub_mask.sum() == 0: return None
-        z, y, x = np.where(sub_mask > 0)
-        fig = go.Figure(data=[go.Isosurface(
-            x=x.flatten(), y=y.flatten(), z=z.flatten(),
-            value=np.ones_like(x).flatten(),
-            isomin=0.5, isomax=1.5, opacity=0.7,
-            colorscale='Reds', caps=dict(x_show=False, y_show=False)
-        )])
-        fig.update_layout(
-            scene=dict(xaxis_title='X', yaxis_title='Y', zaxis_title='Z', aspectmode='data'),
-            margin=dict(l=0, r=0, b=0, t=0),
-            height=600
-        )
-        return fig
-    except Exception as e:
-        st.error(f"3D 시각화 에러: {e}")
-        return None
-
-def make_overlay_figure(image_slice, pred_slice):
-    def norm(img):
-        mn, mx = img.min(), img.max()
-        return (img - mn) / (mx - mn) if mx - mn > 1e-8 else np.zeros_like(img)
-    img_disp = norm(image_slice)
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    axes[0].imshow(img_disp, cmap="gray"); axes[0].set_title("Original Image"); axes[0].axis("off")
-    axes[1].imshow(pred_slice, cmap="gray"); axes[1].set_title("AI Prediction"); axes[1].axis("off")
-    axes[2].imshow(img_disp, cmap="gray"); axes[2].imshow(pred_slice, cmap="Reds", alpha=0.4)
-    axes[2].set_title("Overlay View"); axes[2].axis("off")
-    plt.tight_layout()
-    return fig
-
-# (이하 모델 로직은 기존과 동일)
 def build_model() -> UNet:
-    return UNet(spatial_dims=3, in_channels=1, out_channels=2, channels=(16, 32, 64, 128, 256), strides=(2, 2, 2, 2), num_res_units=2, norm=Norm.BATCH)
+    return UNet(
+        spatial_dims=3, 
+        in_channels=1, 
+        out_channels=2, 
+        channels=(16, 32, 64, 128, 256), 
+        strides=(2, 2, 2, 2), 
+        num_res_units=2, 
+        norm=Norm.BATCH
+    )
 
 @st.cache_resource
 def load_model_cached(model_path: str, device_name: str):
     device = torch.device(device_name)
     model = build_model()
-    state_dict = torch.load(model_path, map_location=device)
-    model.load_state_dict(state_dict)
+    if os.path.exists(model_path):
+        state_dict = torch.load(model_path, map_location=device)
+        model.load_state_dict(state_dict)
     model.to(device).eval()
     return model
 
 def run_inference(image_path, model, device_name, roi_size=(160, 160, 160)):
     device = torch.device(device_name)
-    transforms = Compose([LoadImaged(keys=["image"]), EnsureChannelFirstd(keys=["image"]), Orientationd(keys=["image"], axcodes="RAS"), Spacingd(keys=["image"], pixdim=(1.5, 1.5, 2.0), mode=("bilinear",)), ScaleIntensityRanged(keys=["image"], a_min=-57, a_max=164, b_min=0.0, b_max=1.0, clip=True), CropForegroundd(keys=["image"], source_key="image"), EnsureTyped(keys=["image"])])
+    transforms = Compose([
+        LoadImaged(keys=["image"]), 
+        EnsureChannelFirstd(keys=["image"]), 
+        Orientationd(keys=["image"], axcodes="RAS"), 
+        Spacingd(keys=["image"], pixdim=(1.5, 1.5, 2.0), mode=("bilinear",)), 
+        ScaleIntensityRanged(keys=["image"], a_min=-57, a_max=164, b_min=0.0, b_max=1.0, clip=True), 
+        CropForegroundd(keys=["image"], source_key="image"), 
+        EnsureTyped(keys=["image"])
+    ])
+    
     data = transforms({"image": image_path})
     image = data["image"]
-    affine = data["image_meta_dict"].get("affine", np.eye(4)) if "image_meta_dict" in data else np.eye(4)
     input_tensor = image.unsqueeze(0).to(device)
-    start_time = time.time()
+    
     with torch.no_grad():
         logits = sliding_window_inference(inputs=input_tensor, roi_size=roi_size, sw_batch_size=1, predictor=model)
-    elapsed = time.time() - start_time
+    
     raw_pred = torch.argmax(logits, dim=1)[0].cpu().numpy().astype(np.uint8)
     image_np = image[0].cpu().numpy()
-    return {"image_np": image_np, "raw_pred_np": raw_pred, "affine": affine, "elapsed": elapsed}
+    
+    return {"image_np": image_np, "raw_pred_np": raw_pred}
+
+def load_label(label_path, image_np_shape):
+    # For demo purposes, we simplify label loading to match image_np after transforms.
+    # In a real scenario, labels would need the same transforms as images (except intensity scaling).
+    label_img = nib.load(label_path)
+    label_data = label_img.get_fdata().astype(np.uint8)
+    
+    # Simple resize/crop for demo if shapes don't match (ideally use MONAI transforms)
+    if label_data.shape != image_np_shape:
+        # This is a fallback. Ideally, labels should go through the same Orientation/Spacing/Crop transforms.
+        # For this demo, we'll try to match it or show a warning.
+        st.warning(f"Label shape {label_data.shape} does not match pre-processed image shape {image_np_shape}. Automatic alignment might be needed.")
+        # Padding or cropping to match for visualization purposes
+        new_label = np.zeros(image_np_shape, dtype=np.uint8)
+        min_shape = [min(s1, s2) for s1, s2 in zip(label_data.shape, image_np_shape)]
+        new_label[:min_shape[0], :min_shape[1], :min_shape[2]] = label_data[:min_shape[0], :min_shape[1], :min_shape[2]]
+        return new_label
+    return label_data
 
 # ============================================================
-# 3. 사이드바 설정
+# 2. Sidebar Implementation
 # ============================================================
+
 with st.sidebar:
-    st.header("⚙️ 실행 설정")
-    model_path = st.text_input("모델 파일 (.pth)", value="./best_metric_model.pth")
-    device_name = st.selectbox("디바이스", options=["cpu"] + (["cuda:0"] if torch.cuda.is_available() else []))
-    roi_x = st.number_input("ROI X", 32, 256, 160, 16)
-    roi_y = st.number_input("ROI Y", 32, 256, 160, 16)
-    roi_z = st.number_input("ROI Z", 32, 256, 160, 16)
+    st.header("📂 Data Upload")
+    img_file = st.file_uploader("Upload Image (NIfTI)", type=["nii", "gz"])
+    lbl_file = st.file_uploader("Upload Label (NIfTI)", type=["nii", "gz"])
     
-    st.markdown("---")
-    st.info("이 앱은 MONAI 프레임워크를 기반으로 학습된 3D Segmentation 모델을 실시간으로 추론합니다.")
-
-try:
-    model = load_model_cached(model_path, device_name)
-    st.sidebar.success("✅ 모델 로드 성공")
-except Exception as e:
-    st.sidebar.error(f"❌ 모델 로드 실패: {e}")
-    st.stop()
-
-# ============================================================
-# 4. 입력 파일 선택
-# ============================================================
-st.subheader("📁 입력 파일 선택")
-input_mode = st.radio("입력 방식 선택", options=["파일 업로드", "가상 샘플 생성 (테스트용)", "서버 폴더 탐색"], horizontal=True)
-
-input_path = None
-if input_mode == "파일 업로드":
-    up_file = st.file_uploader("NIfTI 파일(.nii / .nii.gz)", type=None)
-    if up_file:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=up_file.name) as tmp:
-            tmp.write(up_file.getbuffer())
-            input_path = tmp.name
-elif input_mode == "가상 샘플 생성 (테스트용)":
-    if st.button("샘플 데이터 생성"):
-        st.session_state.sample_path = generate_synthetic_nifti()
-        st.success("테스트용 샘플이 생성되었습니다!")
-    if "sample_path" in st.session_state: input_path = st.session_state.sample_path
-else:
-    folder = st.text_input("폴더 경로", ".")
-    files = list_nifti_files(folder)
-    if files: input_path = st.selectbox("파일 선택", options=files, format_func=lambda x: Path(x).name)
+    st.header("📐 Visualization Settings")
+    axis_choice = st.selectbox("Select Axis", options=["Axial", "Coronal", "Sagittal"])
+    axis_map = {"Axial": 2, "Coronal": 1, "Sagittal": 0}
+    ax_idx = axis_map[axis_choice]
+    
+    st.header("🛠️ Post-processing")
+    do_lcc = st.checkbox("Largest Connected Component")
+    do_sor = st.checkbox("Small Object Removal")
+    min_size = st.number_input("Min Size", value=100, min_value=1)
+    do_bc = st.checkbox("Binary Closing")
+    closing_iters = st.number_input("Closing Iterations", value=1, min_value=1)
+    
+    apply_post = st.button("Apply Post-processing", type="primary")
 
 # ============================================================
-# 5. 추론 실행
-# ============================================================
-if st.button("🚀 추론 실행", type="primary"):
-    if input_path:
-        with st.spinner("AI 분석 중... 잠시만 기다려주세요."):
-            try:
-                result = run_inference(input_path, model, device_name, (roi_x, roi_y, roi_z))
-                st.session_state.result = result
-                st.session_state.raw_shape = nib.load(input_path).shape
-                st.session_state.inference_done = True
-            except Exception as e: st.exception(e)
-    else: st.warning("분석할 파일을 먼저 선택해주세요.")
+# 3. Model Loading
+# =============================-==============================
+model_path = "./best_metric_model.pth"
+device = "cuda:0" if torch.cuda.is_available() else "cpu"
+model = load_model_cached(model_path, device)
 
 # ============================================================
-# 6. 결과 표시
+# 4. Main Logic
 # ============================================================
-if st.session_state.inference_done and st.session_state.result:
+
+if img_file:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=img_file.name) as tmp_img:
+        tmp_img.write(img_file.getbuffer())
+        img_path = tmp_img.name
+        
+    if "result" not in st.session_state or st.sidebar.button("Run Inference"):
+        with st.spinner("Running Inference..."):
+            st.session_state.result = run_inference(img_path, model, device)
+            
     res = st.session_state.result
-    raw_pred = res["raw_pred_np"]
     image_np = res["image_np"]
+    raw_pred = res["raw_pred_np"]
     
-    # 상단 Metric 카드 (중요!)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("원본 Shape", str(st.session_state.raw_shape))
-    c2.metric("전처리 Shape", str(image_np.shape))
-    c3.metric("양성 Voxel", int((raw_pred > 0).sum()))
-    c4.metric("추론 시간", f"{res['elapsed']:.2f}s")
+    label_np = None
+    if lbl_file:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=lbl_file.name) as tmp_lbl:
+            tmp_lbl.write(lbl_file.getbuffer())
+            label_np = load_label(tmp_lbl.name, image_np.shape)
+            
+    # Post-processing
+    if apply_post or "post_pred" not in st.session_state:
+        st.session_state.post_pred = post_process(
+            raw_pred, 
+            lcc=do_lcc, 
+            small_obj_removal=do_sor, 
+            min_size=min_size, 
+            binary_closing=do_bc, 
+            closing_iterations=closing_iters
+        )
     
-    st.markdown("---")
+    post_pred = st.session_state.post_pred
     
-    # 2D 뷰어와 3D 뷰어 나란히 배치 (혹은 탭)
-    tab1, tab2 = st.tabs(["🖼️ 2D 슬라이스 뷰어", "🧊 3D 입체 시각화"])
+    # Slice Slider
+    max_slices = image_np.shape[ax_idx]
+    slice_idx = st.sidebar.slider("Select Slice", 0, max_slices - 1, max_slices // 2)
     
-    with tab1:
-        ax = st.radio("축 선택", [0, 1, 2], format_func=lambda x: ["Sagittal", "Coronal", "Axial"][x], horizontal=True, index=2)
-        
-        # 마스크가 가장 많은 슬라이스 찾기
-        slice_sums = [raw_pred[i,:,:].sum() if ax==0 else raw_pred[:,i,:].sum() if ax==1 else raw_pred[:,:,i].sum() for i in range(raw_pred.shape[ax])]
-        best_slice = int(np.argmax(slice_sums)) if sum(slice_sums) > 0 else raw_pred.shape[ax]//2
-        
-        sl_idx = st.slider("슬라이스 인덱스", 0, image_np.shape[ax]-1, best_slice)
-        
-        def get_sl(vol, axis, idx):
-            if axis == 0: return vol[idx, :, :]
-            elif axis == 1: return vol[:, idx, :]
-            return vol[:, :, idx]
-        
-        st.pyplot(make_overlay_figure(get_sl(image_np, ax, sl_idx), get_sl(raw_pred, ax, sl_idx)))
+    # Helper to get slice
+    def get_slice(data, axis, idx):
+        if axis == 0: return data[idx, :, :]
+        if axis == 1: return data[:, idx, :]
+        return data[:, :, idx]
 
-    with tab2:
-        with st.spinner("3D 모델을 생성 중입니다..."):
-            fig_3d = visualize_3d_mask(raw_pred)
-            if fig_3d: st.plotly_chart(fig_3d, use_container_width=True)
-            else: st.warning("시각화할 양성 영역이 없습니다.")
+    img_slice = get_slice(image_np, ax_idx, slice_idx)
+    raw_pred_slice = get_slice(raw_pred, ax_idx, slice_idx)
+    post_pred_slice = get_slice(post_pred, ax_idx, slice_idx)
+    lbl_slice = get_slice(label_np, ax_idx, slice_idx) if label_np is not None else np.zeros_like(img_slice)
 
-    # 결과 다운로드 및 세부 정보
-    with st.expander("📝 상세 정보 및 다운로드"):
-        st.write("Affine Matrix:")
-        st.code(str(res["affine"]))
-        
-        def make_nifti_bytes(np_data, aff):
-            with tempfile.NamedTemporaryFile(suffix=".nii.gz", delete=False) as tmp:
-                nib.save(nib.Nifti1Image(np_data, aff), tmp.name)
-                with open(tmp.name, "rb") as f: return f.read()
-        
-        st.download_button("💾 결과 마스크 다운로드 (.nii.gz)", make_nifti_bytes(raw_pred, res["affine"]), "prediction.nii.gz")
+    # Dice Calculation
+    dice_pre = calculate_dice(label_np, raw_pred) if label_np is not None else 0.0
+    dice_post = calculate_dice(label_np, post_pred) if label_np is not None else 0.0
+
+    # Display Results
+    st.subheader(f"Results Comparison - {axis_choice} Axis (Slice {slice_idx})")
+    
+    if label_np is not None:
+        col_m1, col_m2 = st.columns(2)
+        col_m1.metric("Dice (Before Post-processing)", f"{dice_pre:.4f}")
+        col_m2.metric("Dice (After Post-processing)", f"{dice_post:.4f}", delta=f"{dice_post-dice_pre:.4f}")
+
+    row1_col1, row1_col2, row1_col3 = st.columns(3)
+    
+    with row1_col1:
+        st.write("**Original**")
+        fig, ax = plt.subplots()
+        ax.imshow(img_slice, cmap="gray")
+        ax.axis("off")
+        st.pyplot(fig)
+
+    with row1_col2:
+        st.write("**Label**")
+        fig, ax = plt.subplots()
+        ax.imshow(lbl_slice, cmap="gray")
+        ax.axis("off")
+        st.pyplot(fig)
+
+    with row1_col3:
+        st.write("**Prediction (Before)**")
+        fig, ax = plt.subplots()
+        ax.imshow(raw_pred_slice, cmap="gray")
+        ax.axis("off")
+        st.pyplot(fig)
+
+    row2_col1, row2_col2, row2_col3 = st.columns(3)
+
+    with row2_col1:
+        st.write("**Overlay (Before)**")
+        fig, ax = plt.subplots()
+        ax.imshow(img_slice, cmap="gray")
+        ax.imshow(raw_pred_slice, cmap="Reds", alpha=0.4)
+        ax.axis("off")
+        st.pyplot(fig)
+
+    with row2_col2:
+        st.write("**Prediction (After)**")
+        fig, ax = plt.subplots()
+        ax.imshow(post_pred_slice, cmap="gray")
+        ax.axis("off")
+        st.pyplot(fig)
+
+    with row2_col3:
+        st.write("**Overlay (After)**")
+        fig, ax = plt.subplots()
+        ax.imshow(img_slice, cmap="gray")
+        ax.imshow(post_pred_slice, cmap="Reds", alpha=0.4)
+        ax.axis("off")
+        st.pyplot(fig)
+
+else:
+    st.info("Please upload a medical image (NIfTI) to begin.")
